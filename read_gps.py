@@ -34,6 +34,23 @@ NTRIP_URL = "108.59.49.226:9000/MSM4_NEAR"  # InDOT; MSM4 = GPS+GLO+GAL+BDS
 NTRIP_USER = NTRIP_PASSWORD = "automp1"
 GSV_SYSTEM = {"GP": "GPS", "GL": "GLONASS", "GA": "Galileo", "GB": "BeiDou",
               "BD": "BeiDou", "GQ": "QZSS", "GI": "NavIC"}
+# NMEA 4.10/4.11 GSV signal IDs -> band names, per talker
+SIGNAL_NAME = {
+    "GP": {"1": "L1CA", "2": "L1P", "3": "L1M", "4": "L2P", "5": "L2CM", "6": "L2CL", "7": "L5I", "8": "L5Q"},
+    "GL": {"1": "G1CA", "2": "G1P", "3": "G2CA", "4": "G2P"},
+    "GA": {"1": "E5a", "2": "E5b", "3": "E5ab", "4": "E6A", "5": "E6BC", "6": "E1A", "7": "E1BC"},
+    "GB": {"1": "B1I", "2": "B1Q", "3": "B1C", "4": "B1A", "5": "B2a", "6": "B2b", "7": "B2ab",
+           "8": "B3I", "9": "B3Q", "A": "B3A", "B": "B2I", "C": "B2Q"},
+    "GQ": {"1": "L1CA", "2": "L1CD", "3": "L1CP", "4": "LIS", "5": "L2CM", "6": "L2CL", "7": "L5I", "8": "L5Q",
+           "9": "L6D", "A": "L6E"},
+    "GI": {"1": "L5", "2": "S", "3": "L5RS", "4": "SRS", "5": "L1"},
+}
+SIGNAL_NAME["BD"] = SIGNAL_NAME["GB"]
+# bands in the L1/E1/B1/G1 group; tracking anything else means the receiver is multi-band
+L1_BANDS = {"L1CA", "L1P", "L1M", "L1CD", "L1CP", "LIS", "G1CA", "G1P", "E1A", "E1BC", "B1I", "B1Q", "B1C", "B1A"}
+WEAK_SNR = 35  # dB-Hz; below this a satellite is a poor candidate for an RTK fix
+LOW_ELEV = 15  # degrees; satellites this low are expected to be weak
+COMPASS = ("N", "NE", "E", "SE", "S", "SW", "W", "NW")
 
 
 def nmea_checksum_ok(sentence: bytes) -> bool:
@@ -54,6 +71,10 @@ def dm_to_deg(value: str, hemi: str):
     dot = value.index(".")
     deg = float(value[:dot - 2]) + float(value[dot - 2:]) / 60.0
     return -deg if hemi in ("S", "W") else deg
+
+
+def to_int(value: str):
+    return int(float(value)) if value else None
 
 
 def make_gga(lat: float, lon: float, alt: float = 0.0) -> bytes:
@@ -135,7 +156,7 @@ class GpsState:
         self.diff_age = self.diff_station = None
         self.speed_kn = self.course = None
         self.antenna = None
-        self.gsv = {}          # (talker, signal_id) -> {prn: snr}
+        self.gsv = {}          # (talker, signal_id) -> {prn: (elevation, azimuth, snr)}
         self.gsv_pending = {}  # sats being accumulated across multi-part GSV
         self.counts = Counter()
         self.rtcm = Counter()
@@ -180,9 +201,9 @@ class GpsState:
             if num == 1:
                 pending.clear()
             for i in range(0, len(sats) - 3, 4):
-                prn, snr = sats[i], sats[i + 3]
+                prn, elev, az, snr = sats[i:i + 4]
                 if prn:
-                    pending[prn] = int(snr) if snr else None
+                    pending[prn] = (to_int(elev), to_int(az), to_int(snr))
             if num == total:
                 self.gsv[key] = dict(pending)
                 pending.clear()
@@ -356,19 +377,80 @@ def fmt(v, spec="", none="--"):
     return none if v is None else format(v, spec)
 
 
+def compass(az):
+    return COMPASS[int((az + 22.5) // 45) % 8]
+
+
+def snr_cell(snr, width=6):
+    text = f"{snr if snr is not None else '-':>{width}}"
+    if snr is None:
+        return text
+    return ("\033[92m" if snr >= 40 else "\033[0m" if snr >= WEAK_SNR else "\033[91m") + text + "\033[0m"
+
+
+def sky_lines(st: GpsState):
+    """Per-satellite elevation/azimuth/SNR-per-band table, plus band and sky-direction summaries."""
+    sky = {}    # system -> {prn: {"elev", "az", "snr": {band: snr}}}
+    bands = {}  # system -> band names, in signal-ID order
+    signal_ids = set()
+    for (talker, sig), sats in sorted(st.gsv.items()):
+        sysname = GSV_SYSTEM.get(talker, talker)
+        signal_ids.add(sig)
+        band = SIGNAL_NAME.get(talker, {}).get(sig, f"sig{sig}") if sig not in ("", "0") else "all"
+        if band not in bands.setdefault(sysname, []):
+            bands[sysname].append(band)
+        for prn, (elev, az, snr) in sats.items():
+            sat = sky.setdefault(sysname, {}).setdefault(prn, {"elev": elev, "az": az, "snr": {}})
+            sat["snr"][band] = snr
+    if not sky:
+        return ["  none"]
+
+    lines = []
+    sectors = {d: [] for d in COMPASS}  # best SNR of each satellite above LOW_ELEV, by direction
+    tracked_bands = {}
+    for sysname in sorted(sky):
+        names = bands[sysname]
+        tracked = {p: s for p, s in sky[sysname].items() if any(s["snr"].values())}
+        untracked = sorted(set(sky[sysname]) - set(tracked), key=lambda p: to_int(p) or 0)
+        lines.append(f"  {sysname:8}  elev   az    " + "".join(f"{b:>6}" for b in names))
+        for prn, s in sorted(tracked.items(), key=lambda kv: -(kv[1]["elev"] if kv[1]["elev"] is not None else -1)):
+            elev, az = s["elev"], s["az"]
+            direction = compass(az) if az is not None else ""
+            low = "  low" if elev is not None and elev < LOW_ELEV else ""
+            lines.append(f"    {prn:>4}  {elev if elev is not None else '--':>4}  {az if az is not None else '--':>3} "
+                         f"{direction:<2}" + "".join(snr_cell(s["snr"].get(b)) for b in names) + low)
+            best = max(filter(None, s["snr"].values()))
+            if elev is not None and elev >= LOW_ELEV and az is not None:
+                sectors[direction].append(best)
+            for b, snr in s["snr"].items():
+                if snr:
+                    tracked_bands.setdefault(sysname, set()).add(b)
+        if untracked:
+            lines.append(f"    not tracked: {' '.join(untracked)}")
+
+    if signal_ids <= {"", "0"}:
+        verdict = "receiver doesn't report signal IDs (needs NMEA 4.10+), can't tell bands apart"
+    elif any(b not in L1_BANDS | {"all"} for bs in tracked_bands.values() for b in bs):
+        verdict = "multi-band"
+    else:
+        verdict = "L1 only (single-band)"
+    lines += [
+        "",
+        "Bands: " + " | ".join(f"{sysname} {' '.join(b for b in bands[sysname] if b in bs)}"
+                               for sysname, bs in sorted(tracked_bands.items())) + f"  -> {verdict}",
+        f"By direction, sats above {LOW_ELEV} deg (mean best SNR, weak<{WEAK_SNR} / total):",
+        "  " + "  ".join(f"{d} {sum(v) / len(v):.0f} ({sum(x < WEAK_SNR for x in v)}/{len(v)})" if v else f"{d} --"
+                         for d, v in sectors.items()),
+    ]
+    return lines
+
+
 def render(st: GpsState, port: str, baud: int, ntrip: NtripClient = None) -> str:
     q = FIX_QUALITY.get(st.quality, str(st.quality))
     colour = {4: "\033[92m", 5: "\033[93m", 0: "\033[91m"}.get(st.quality, "\033[96m")
     t = st.time or ""
     utc = f"{t[0:2]}:{t[2:4]}:{t[4:]}" if len(t) >= 6 else "--"
     stale = time.time() - st.last_gga > 2
-
-    by_system = {}
-    for (talker, _sig), sats in st.gsv.items():
-        sysname = GSV_SYSTEM.get(talker, talker)
-        for prn, snr in sats.items():
-            prev = by_system.setdefault(sysname, {}).get(prn)
-            by_system[sysname][prn] = max(filter(None, (prev, snr)), default=None)
 
     lines = [
         f"RTK GPS on {port} @ {baud}" + ("   \033[91m[no GGA for >2s]\033[0m" if stale else ""),
@@ -382,14 +464,9 @@ def render(st: GpsState, port: str, baud: int, ntrip: NtripClient = None) -> str
         f"Corrections age {st.diff_age or '--'} s   base station {st.diff_station or '--'}",
         f"Antenna    {st.antenna or '--'}",
         "",
-        "Satellites in view (PRN:SNR dB-Hz):",
+        f"Satellites (elev/azimuth deg, SNR dB-Hz per band; green 40+, red <{WEAK_SNR}, low = below {LOW_ELEV} deg):",
     ]
-    if by_system:
-        for sysname, sats in sorted(by_system.items()):
-            sat_txt = " ".join(f"{p}:{s if s is not None else '-'}" for p, s in sorted(sats.items()))
-            lines.append(f"  {sysname:8} {len(sats):2}  {sat_txt}")
-    else:
-        lines.append("  none")
+    lines += sky_lines(st)
     lines.append("")
     if ntrip:
         age = f"{time.monotonic() - ntrip.last_rx:.1f} s ago" if ntrip.last_rx else "never"
